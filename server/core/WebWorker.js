@@ -5336,20 +5336,29 @@ class WebWorker {
                         return ai - bi;
                     });
 
-                const result = [];
-                for (const entryName of entryNames) {
-                    const id = entryName.substring(prefix.length);
-                    if (!id)
-                        continue;
+                //djxl запускается отдельным процессом на каждую картинку, поэтому
+                //декодируем параллельно по числу ядер, порядок сохраняем по индексу
+                const images = new Array(entryNames.length);
+                let next = 0;
+                const decode = async() => {
+                    while (next < entryNames.length) {
+                        const i = next++;
+                        const entryName = entryNames[i];
+                        const id = entryName.substring(prefix.length);
+                        if (!id)
+                            continue;
 
-                    try {
-                        const data = await zipReader.extractToBuf(entryName);
-                        result.push(Object.assign({id}, await imageUtils.normalizeForFb2(data, this.config.tempDir, this.libraryToolDirs(sourceLibDir), this.config.converterPaths)));
-                    } catch(e) {
-                        log(LM_ERR, `image ${entryName}: ${e.message}`);
+                        try {
+                            const data = await zipReader.extractToBuf(entryName);
+                            images[i] = Object.assign({id}, await imageUtils.normalizeForFb2(data, this.config.tempDir, this.libraryToolDirs(sourceLibDir), this.config.converterPaths));
+                        } catch(e) {
+                            log(LM_ERR, `image ${entryName}: ${e.message}`);
+                        }
                     }
-                }
+                };
+                await Promise.all(Array.from({length: os.availableParallelism()}, decode));
 
+                const result = images.filter(Boolean);
                 if (result.length)
                     return result;
             } finally {
