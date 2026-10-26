@@ -1,4 +1,5 @@
 ﻿const os = require('os');
+const {AsyncLocalStorage} = require('async_hooks');
 const path = require('path');
 const crypto = require('crypto');
 const fs = require('fs-extra');
@@ -59,6 +60,11 @@ const fb2AssetVersion = 'fb2-encoding-v6';
 const bookInfoVersion = 'fb2-encoding-v8';
 const bookCardVersion = 'card-v1';
 const bookGalleryLimit = 18;
+//Сколько фоновых задач (обложки списка, фоновая подготовка книг) читают библиотеку одновременно.
+//Сетевой диск выполняет параллельные чтения по очереди: 100 обложек сразу отдают первую через 8 с
+const backgroundIoLimit = 2;
+//Метка фоновой задачи: {background: true}. Пользователь, который ждёт ту же книгу, снимает метку
+const ioPriority = new AsyncLocalStorage();
 
 //fn для каждого элемента, не больше limit одновременно; результаты в порядке items
 async function mapLimit(items, limit, fn) {
@@ -949,6 +955,27 @@ class WebWorker {
         this.authorToArchive = null;
         this.reviewArchiveStates = new Map();
         this.preparedBookSizes = new Map();
+        this.libraryDirListings = new Map();
+    }
+
+    //Чтение папок библиотеки на сетевом диске медленное, а параллельные чтения
+    //выполняются по очереди. Кэшируем список файлов до сброса кэшей библиотеки.
+    readLibraryDirCached(dir) {
+        if (!this.libraryDirListings)
+            this.libraryDirListings = new Map();
+
+        let listing = this.libraryDirListings.get(dir);
+        if (!listing) {
+            listing = fs.readdir(dir).catch((e) => {
+                if (e.code === 'ENOENT' || e.code === 'ENOTDIR')
+                    return [];
+                this.libraryDirListings.delete(dir);
+                throw e;
+            });
+            this.libraryDirListings.set(dir, listing);
+        }
+
+        return listing;
     }
 
     async dbConfig() {
@@ -5225,11 +5252,11 @@ class WebWorker {
 
         const dir = path.dirname(filePath);
         const baseName = path.basename(filePath).toLowerCase();
-        if (!dir || !baseName || !await fs.pathExists(dir))
+        if (!dir || !baseName)
             return '';
 
         try {
-            const entries = await fs.readdir(dir);
+            const entries = await this.readLibraryDirCached(dir);
             const match = entries.find(item => item.toLowerCase() === baseName);
             return match ? path.join(dir, match) : '';
         } catch(e) {
@@ -5336,6 +5363,58 @@ class WebWorker {
             });
     }
 
+    //Работа, которую ждёт пользователь (карточка, чтение, скачивание). Пока она идёт,
+    //фоновые задачи не начинают новых чтений библиотеки
+    async runForeground(fn) {
+        const priority = ioPriority.getStore();
+        if (priority && priority.background)
+            return await fn();
+
+        this.foregroundJobs = (this.foregroundJobs || 0) + 1;
+        try {
+            return await fn();
+        } finally {
+            this.foregroundJobs--;
+            this.wakeBackgroundJobs();
+        }
+    }
+
+    //isCancelled: результат больше не нужен (например, браузер закрыл запрос обложки)
+    async runBackground(fn, isCancelled = () => false) {
+        while (this.foregroundJobs || (this.backgroundJobs || 0) >= backgroundIoLimit)
+            await this.waitBackgroundTurn();
+        if (isCancelled())
+            return null;
+
+        this.backgroundJobs = (this.backgroundJobs || 0) + 1;
+        try {
+            return await ioPriority.run({background: true}, fn);
+        } finally {
+            this.backgroundJobs--;
+            this.wakeBackgroundJobs();
+        }
+    }
+
+    //Долгая фоновая задача уступает пользователю между шагами
+    async yieldToForeground() {
+        const priority = ioPriority.getStore();
+        while (priority && priority.background && this.foregroundJobs)
+            await this.waitBackgroundTurn();
+    }
+
+    waitBackgroundTurn() {
+        if (!this.backgroundWaiters)
+            this.backgroundWaiters = [];
+        return new Promise(resolve => this.backgroundWaiters.push(resolve));
+    }
+
+    wakeBackgroundJobs() {
+        const waiters = this.backgroundWaiters || [];
+        this.backgroundWaiters = [];
+        for (const resolve of waiters)
+            resolve();
+    }
+
     async getFblibraryImages(libid, sourceLibDir = '', libFolder = '') {
         const archives = libFolder ? await this.getBookAssetArchives('images', libFolder, sourceLibDir)
             : await this.getFblibraryArchives('images', libid, sourceLibDir);
@@ -5362,6 +5441,7 @@ class WebWorker {
                     if (!id)
                         return null;
 
+                    await this.yieldToForeground();
                     try {
                         const data = await zipReader.extractToBuf(entryName);
                         return Object.assign({id}, await imageUtils.normalizeForFb2(data, this.config.tempDir, this.libraryToolDirs(sourceLibDir), this.config.converterPaths));
@@ -5414,9 +5494,7 @@ class WebWorker {
         ]));
         const exact = [];
         for (const dir of dirs) {
-            if (!await fs.pathExists(dir))
-                continue;
-            for (const name of await fs.readdir(dir)) {
+            for (const name of await this.readLibraryDirCached(dir)) {
                 if (['.zip', '.7z'].includes(path.extname(name).toLowerCase())
                     && path.basename(name, path.extname(name)).toLowerCase() === baseName.toLowerCase())
                     exact.push({file: path.join(dir, name)});
@@ -5823,17 +5901,23 @@ class WebWorker {
     //одновременные запросы одной книги (карточка в фоне, «Читать», «Скачать»)
     //ждут одну подготовку
     async getBookLink(bookUid) {
-        if (!this.bookLinkJobs)
-            this.bookLinkJobs = new Map();
+        return await this.runForeground(async() => {
+            if (!this.bookLinkJobs)
+                this.bookLinkJobs = new Map();
 
-        let job = this.bookLinkJobs.get(bookUid);
-        if (!job) {
-            job = this.prepareBookLink(bookUid).finally(() => this.bookLinkJobs.delete(bookUid));
-            this.bookLinkJobs.set(bookUid, job);
-        }
+            const priority = ioPriority.getStore();
+            let job = this.bookLinkJobs.get(bookUid);
+            if (!job) {
+                job = {priority, promise: this.prepareBookLink(bookUid).finally(() => this.bookLinkJobs.delete(bookUid))};
+                this.bookLinkJobs.set(bookUid, job);
+            } else if (job.priority && !(priority && priority.background)) {
+                //пользователь ждёт книгу, которую готовит фон: подготовка больше не уступает
+                job.priority.background = false;
+            }
 
-        //вызывающие дополняют результат, поэтому каждому своя копия
-        return Object.assign({}, await job);
+            //вызывающие дополняют результат, поэтому каждому своя копия
+            return Object.assign({}, await job.promise);
+        });
     }
 
     async prepareBookLink(bookUid) {
@@ -6494,7 +6578,7 @@ class WebWorker {
         (async() => {
             await this.backgroundBookQueue.get();
             try {
-                await this.getBookLink(bookUid);
+                await this.runBackground(() => this.getBookLink(bookUid));
             } finally {
                 this.backgroundBookQueue.ret();
             }
@@ -6504,6 +6588,10 @@ class WebWorker {
     //Карточке книги нужны описание FB2, содержание и отзывы. Иллюстрации и обложку
     //не извлекаем: обложку клиент берёт из /cover/by-uid, иллюстрации - из getBookGallery
     async getBookCardInfo(bookUid) {
+        return await this.runForeground(() => this.buildBookCard(bookUid));
+    }
+
+    async buildBookCard(bookUid) {
         this.checkMyState();
 
         const db = this.db;

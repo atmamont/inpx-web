@@ -145,7 +145,7 @@ async function testBookCardSkipsIllustrationsAndPreparesBookInBackground() {
         assert.strictEqual(await preparedOnce, record._uid, 'The full book is prepared in the background');
 
         // Reading and downloading during the background preparation wait for the same work.
-        await worker.bookLinkJobs.get(record._uid);
+        await (worker.bookLinkJobs.get(record._uid) || {}).promise;
         const [first, second] = await Promise.all([worker.getBookLink(record._uid), worker.getBookLink(record._uid)]);
         assert.strictEqual(preparations, 2, 'Two parallel requests prepare the book once');
         assert.notStrictEqual(first, second);
@@ -157,6 +157,37 @@ async function testBookCardSkipsIllustrationsAndPreparesBookInBackground() {
     } finally {
         await fs.remove(dir);
     }
+}
+
+async function testBackgroundLibraryWorkWaitsForUser() {
+    const worker = Object.create(require('../server/core/WebWorker').prototype);
+    const events = [];
+    let finishCard;
+    const card = worker.runForeground(() => new Promise(resolve => { finishCard = resolve; }));
+
+    const covers = [1, 2, 3].map(n => worker.runBackground(async() => { events.push(`cover ${n}`); }));
+    const cancelled = worker.runBackground(async() => { events.push('closed cover'); }, () => true);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.deepStrictEqual(events, [], 'Covers wait while the user waits for the card');
+
+    finishCard();
+    await card;
+    await Promise.all([...covers, cancelled]);
+    assert.deepStrictEqual(events, ['cover 1', 'cover 2', 'cover 3'], 'Covers run after the card, a closed request is skipped');
+
+    // The background preparation yields between images, but not when the user waits for the same book.
+    let releasePreparation;
+    worker.prepareBookLink = async() => {
+        await new Promise(resolve => { releasePreparation = resolve; });
+        await worker.yieldToForeground();
+        return {link: '/book/hash'};
+    };
+    const background = worker.runBackground(() => worker.getBookLink('uid'));
+    await new Promise(resolve => setTimeout(resolve, 10));
+    const reader = worker.getBookLink('uid');
+    releasePreparation();
+    assert.deepStrictEqual(await reader, {link: '/book/hash'});
+    await background;
 }
 
 async function testBookGalleryReturnsFirstImagesWithoutCover() {
@@ -178,4 +209,4 @@ async function testBookGalleryReturnsFirstImagesWithoutCover() {
 }
 
 module.exports = [testReaderColdDocumentDoesNotWaitForReviewIndex, testCatalogOpensReaderBeforeColdFilePreparation,
-    testBookCardSkipsIllustrationsAndPreparesBookInBackground, testBookGalleryReturnsFirstImagesWithoutCover];
+    testBookCardSkipsIllustrationsAndPreparesBookInBackground, testBackgroundLibraryWorkWaitsForUser, testBookGalleryReturnsFirstImagesWithoutCover];
